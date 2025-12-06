@@ -1,0 +1,108 @@
+import React from 'react';
+import { StyleSheet, View, TextInput, KeyboardAvoidingView, Platform } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { StatusBar } from 'expo-status-bar';
+import Typography from '@/components/ui/Typography/Typography';
+import { useCustomTheme } from '@/hooks/useCustomTheme';
+import { Colors } from '@/constants';
+import useVideoUploadStore from '@/store/videoUploadStore';
+import BackButton from '@/components/utilities/BackButton';
+import AppButton from '@/components/ui/AppButton';
+import { useLocalSearchParams, useRouter } from 'expo-router';
+
+export default function EditDescriptionScreen() {
+  const { theme } = useCustomTheme();
+  const { videoDetails, setVideoDetails } = useVideoUploadStore();
+  const router = useRouter();
+  const { description } = useLocalSearchParams();
+
+  // console.log("description", description);
+
+  return (
+    <SafeAreaView style={[styles.container, { backgroundColor: Colors[theme].background }]} edges={['top']}>
+      <StatusBar style={theme === 'dark' ? 'light' : 'dark'} />
+      
+      <View style={styles.header}>
+        <View style={{ flexDirection: 'row', alignItems: "center", gap: 12 }}>
+          <BackButton/>
+          <Typography size={18} style={{ marginLeft: 10 }} weight="600">
+            Edit description
+          </Typography>
+
+        </View>
+
+          <AppButton
+            title="Done" 
+            variant="compact" 
+            handlePress={() => router.back()}
+            style={{ marginRight: 8 }}
+          />
+
+      </View>
+
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        style={styles.keyboardAvoid}
+      >
+        <View style={styles.content}>
+          <TextInput
+            style={[
+              styles.textAreaInput, 
+              { 
+                color: Colors[theme].text,
+              }
+            ]}
+            placeholder="Tell viewers about your video"
+            placeholderTextColor={Colors[theme].secondary}
+            defaultValue={description as string}
+            // value={videoDetails.description}
+            onChangeText={(text) => setVideoDetails({ description: text })}
+            multiline
+            numberOfLines={10}
+            textAlignVertical="top"
+            autoFocus
+          />
+          
+          <Typography size={14} weight="400" textType="secondary" style={styles.helper}>
+            A good description helps viewers find your video in search results
+          </Typography>
+        </View>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  backButton: {
+    padding: 8,
+  },
+  saveButton: {
+    padding: 8,
+  },
+  keyboardAvoid: {
+    flex: 1,
+  },
+  content: {
+    flex: 1,
+    padding: 16,
+  },
+  textAreaInput: {
+    padding: 12,
+    fontSize: 16,
+    minHeight: 150,
+  },
+  helper: {
+    marginTop: 12,
+  },
+});

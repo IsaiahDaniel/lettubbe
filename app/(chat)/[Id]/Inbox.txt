@@ -1,0 +1,1178 @@
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  FlatList,
+  TouchableOpacity,
+  ActivityIndicator,
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { Ionicons } from "@expo/vector-icons";
+import { useRouter, useLocalSearchParams } from "expo-router";
+import Avatar from "@/components/ui/Avatar";
+import { Colors } from "@/constants/Colors";
+import { useCustomTheme } from "@/hooks/useCustomTheme";
+import ChatInput from "@/components/ui/inputs/ChatInput";
+import Typography from "@/components/ui/Typography/Typography";
+import useCallStore from "@/store/callsStore";
+import { CallType } from "@/helpers/types/chat/call";
+// import useVoiceCall from "@/hooks/agora/voice/useVoiceCall";
+import useChat from "@/hooks/chats/useChat";
+import useAuth from "@/hooks/auth/useAuth";
+import { truncateText } from "@/helpers/utils/util";
+import useGetUserConversations from "@/hooks/chats/useGetUserConversations";
+import { formatTimeAgo } from "@/helpers/utils/formatting";
+import useGetPublicProfile from "@/hooks/profile/useGetPublicProfile";
+import ReportModal from "@/components/shared/home/report/ReportModal";
+import MessageStatus from "@/components/ui/MessageStatus";
+import SharedVideoCard from "@/components/shared/chat/SharedVideoCard";
+import SharedPhotoCard from "@/components/shared/chat/SharedPhotoCard";
+import CommunityInviteCard from "@/components/shared/chat/CommunityInviteCard";
+import { getSocket } from "@/helpers/utils/socket";
+import { useAlert } from "@/components/ui/AlertProvider";
+import DateSeparator from "@/components/shared/chat/DateSeparator";
+import { groupMessagesByDate, flattenMessagesWithSeparators, MessageWithDate } from "@/helpers/utils/dateUtils";
+import useMarkConversationRead from "@/hooks/chats/useMarkConversationRead";
+import { useFocusEffect } from "@react-navigation/native";
+import ChatSkeletonLoader from "@/components/shared/chat/ChatMessageSkeleton";
+import { useQueryClient } from "@tanstack/react-query";
+import useChatPicker from "@/hooks/chats/useChatPicker";
+import useUploadPhotoInChat from "@/hooks/chats/useUploadPhotoInChat";
+
+// Define message interface
+interface Message {
+  _id: string | undefined;
+  sender: any;
+  id?: string;
+  text: string;
+  userId: string;
+  time?: string;
+  createdAt?: string;
+  seen?: boolean;
+}
+
+const InboxScreen = () => {
+
+  const router = useRouter();
+  const searchParams = useLocalSearchParams();
+  
+  // Parameter extraction with null guards
+  const chatId = searchParams.Id?.toString() || '';
+  const username = searchParams.username?.toString() || '';
+  const displayName = searchParams.displayName?.toString() || '';
+  const userId = searchParams.userId?.toString() || '';
+  const subscriberCount = searchParams.subscriberCount?.toString() || '0';
+  const avatar = searchParams.avatar?.toString() || '';
+  const shareVideoData = searchParams.shareVideoData?.toString() || '';
+
+  const { theme } = useCustomTheme();
+  // const {
+  //   initiateCall,
+  //   currentCall,
+  //   isInitiatingCall,
+  //   setIsInitiatingCall,
+  //   setCallType,
+  //   callType,
+  // } = useVoiceCall("");
+  const {
+    handleSendChat,
+    messages,
+    chatMessage,
+    setChatMessage,
+    userOnlineStatus,
+    flatListRef,
+    loadingMessages,
+    otherUserTyping,
+    handleTypingStart,
+    handleTypingStop,
+    markMessagesAsRead,
+  } = useChat(chatId);
+
+  const { userDetails, token } = useAuth();
+  const { showError } = useAlert();
+  const markConversationRead = useMarkConversationRead();
+  const { isPickerOpen, togglePicker } = useChatPicker("chat");
+  const { isUploading: isUploadingPhoto, uploadedImageUrls, setUploadedImageUrls, removeUploadedUrl } = useUploadPhotoInChat(togglePicker);
+  const queryClient = useQueryClient();
+
+  // Report modal state
+  const [isReportModalVisible, setIsReportModalVisible] = useState(false);
+
+  // Scroll to bottom button state
+  const [showScrollToBottomButton, setShowScrollToBottomButton] = useState(false);
+
+  const isUnmountedRef = useRef(false);
+
+  // Ref to track if shared video data has been processed
+  const processedShareVideoData = useRef<string | null>(null);
+  // Ref to track if conversation has been marked as read for this session
+  const markedAsReadRef = useRef<string | null>(null);
+
+  // Preload profile data for when user navigates to profile
+  // Always call hook with fallback to prevent conditional hook calls
+  const { data: preloadedProfileData, profilePic: preloadedProfilePic } =
+    useGetPublicProfile(userId || '');
+
+  // Extract user ID from token as fallback with null checking
+  const getUserIdFromToken = (token: string | null) => {
+    try {
+      if (!token || typeof token !== 'string') return null;
+      
+      const parts = token.split(".");
+      if (parts.length !== 3) return null;
+      
+      const payload = JSON.parse(atob(parts[1]));
+      return payload?.id?.toString() || null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const currentUserId = userDetails?._id?.toString() || getUserIdFromToken(token);
+
+  // I'll handle missing data in the render logic instead of early return
+  // to avoid conditional hook issues
+
+  // Memoized functions to check message types and extract data
+  const extractVideoDataFromMessage = useCallback((text: string) => {
+    try {
+      if (!text || typeof text !== 'string') return null;
+      
+      const videoLinkPattern = /^lettubbe:\/\/video\/([^?]+)\?data=(.+)$/;
+      const match = text.match(videoLinkPattern);
+
+      if (match) {
+        const videoId = match[1]?.toString() || '';
+        const encodedData = match[2]?.toString() || '';
+        
+        if (!videoId || !encodedData) return null;
+        
+        const videoData = JSON.parse(decodeURIComponent(encodedData));
+        return videoData || {};
+      }
+      return null;
+    } catch (error) {
+      return null;
+    }
+  }, []);
+
+  const extractCommunityInviteDataFromMessage = useCallback((text: string) => {
+    try {
+      if (!text || typeof text !== 'string') return null;
+      
+      const inviteLinkPattern = /^lettubbe:\/\/community\/([^?]+)\?invite=true&data=(.+)$/;
+      const match = text.match(inviteLinkPattern);
+
+      if (match) {
+        const communityId = match[1]?.toString() || '';
+        const encodedData = match[2]?.toString() || '';
+        
+        if (!communityId || !encodedData) return null;
+        
+        const inviteData = JSON.parse(decodeURIComponent(encodedData));
+        return inviteData || {};
+      }
+      return null;
+    } catch (error) {
+      return null;
+    }
+  }, []);
+
+  // timestamp formatting function
+  const formatMessageTime = useCallback((timeString?: string) => {
+    if (!timeString) return "";
+    
+    try {
+      const messageTime = new Date(timeString);
+      if (isNaN(messageTime.getTime())) return "";
+      
+      // Simple, clean format like community chat
+      return messageTime.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch (error) {
+      return "";
+    }
+  }, []);
+
+  // Profile object construction with null guards
+  const profile = useMemo(() => {
+    const preloadedData = preloadedProfileData || {};
+    const profilePic = preloadedProfilePic || {};
+    
+    // Helper function for display name
+    const getDisplayName = () => {
+      if (preloadedData?.displayName) return preloadedData.displayName;
+      if (preloadedData?.firstName && preloadedData?.lastName) {
+        return `${preloadedData.firstName} ${preloadedData.lastName}`;
+      }
+      if (preloadedData?.firstName) return preloadedData.firstName;
+      if (preloadedData?.username) return preloadedData.username;
+      if (displayName) return displayName;
+      if (username) return username;
+      return "Unknown User";
+    };
+
+    // Helper function for avatar URL
+    const getAvatarUrl = () => {
+      if (profilePic?.uri) return profilePic.uri;
+      if (preloadedData?.profilePicture) return preloadedData.profilePicture;
+      if (avatar) return avatar;
+      return "https://randomuser.me/api/portraits/lego/1.jpg";
+    };
+    
+    return {
+      username: preloadedData?.username?.toString() || username || "Unknown User",
+      displayName: getDisplayName(),
+      avatar: getAvatarUrl(),
+      bio: preloadedData?.description ? 
+           truncateText(preloadedData.description.toString(), 30) : "",
+      subscribers: preloadedData?.subscriberCount?.toString() || subscriberCount || "0",
+    };
+  }, [preloadedProfileData, preloadedProfilePic, username, displayName, avatar, subscriberCount]);
+
+  // otherUser object is now memoized below to prevent recreation
+
+  // Effect to monitor call state changes
+  // useEffect(() => {
+  //   if (isInitiatingCall && currentCall) {
+  //     setIsInitiatingCall(false);
+  //     router.push("/(calls)/ongoing-call");
+  //   }
+  // }, [currentCall, isInitiatingCall]);
+
+  // Handle shared video data with comprehensive null checking
+  useEffect(() => {
+    if (
+      !shareVideoData ||
+      typeof shareVideoData !== "string" ||
+      processedShareVideoData.current === shareVideoData ||
+      !currentUserId ||
+      !userId ||
+      !token
+    ) {
+      return;
+    }
+
+    try {
+      const parsedData = JSON.parse(shareVideoData);
+      const video = parsedData?.video || null;
+      const caption = parsedData?.caption?.toString() || '';
+
+      if (!video || !video._id) {
+        console.warn("Invalid video data in shareVideoData");
+        return;
+      }
+
+      // Create video link with embedded data
+      const videoLink = `lettubbe://video/${video._id?.toString() || ''}?data=${encodeURIComponent(JSON.stringify(video))}`;
+
+      // Send video link directly via socket
+      const socket = getSocket(token);
+      if (!socket) {
+        console.warn("Socket not available for sharing video");
+        return;
+      }
+
+      const videoMessage = {
+        sender: currentUserId,
+        receiver: userId,
+        text: videoLink,
+        userId: currentUserId,
+      };
+
+      socket.emit("chat", videoMessage);
+
+      // Mark this data as processed after successful sending
+      processedShareVideoData.current = shareVideoData;
+
+      // If there's a caption, send it as a separate text message
+      if (caption && caption.trim()) {
+        setTimeout(() => {
+          const captionMessage = {
+            sender: currentUserId,
+            receiver: userId,
+            text: caption,
+            userId: currentUserId,
+          };
+
+          socket.emit("chat", captionMessage);
+        }, 300);
+      }
+    } catch (error) {
+      console.error("Error processing shared video data:", error);
+    }
+  }, [shareVideoData, currentUserId, token, userId]);
+
+
+  // Mark conversation as read when screen is focused
+  useFocusEffect(
+    React.useCallback(() => {
+      // Only mark once per session to prevent loops
+      if (chatId && typeof chatId === 'string' && markedAsReadRef.current !== chatId) {
+        markedAsReadRef.current = chatId;
+        
+        // Socket call for immediate read receipt
+        if (markMessagesAsRead) {
+          try {
+            markMessagesAsRead();
+          } catch (error) {
+            console.error("Error marking messages as read via socket:", error);
+          }
+        }
+
+        // Conservative API call after delay for persistence
+        setTimeout(() => {
+          if (markConversationRead && !markConversationRead.isPending) {
+            markConversationRead.mutate(chatId);
+          }
+        }, 2000); // Longer delay to avoid conflicts
+      }
+
+      // Return cleanup function when leaving chat
+      return () => {
+        // Refresh conversation list when leaving to show updated counts
+        if (chatId && markedAsReadRef.current === chatId) {
+          // Invalidate conversation queries to refresh unread counts in list
+          queryClient.invalidateQueries({ queryKey: ['getUserConversations'] });
+          queryClient.invalidateQueries({ queryKey: ['unreadCount'] });
+        }
+      };
+    }, [chatId, markMessagesAsRead, markConversationRead, queryClient])
+  );
+
+  const viewProfile = useCallback(() => {
+    if (!userId || !router || !profile) {
+      console.warn("Cannot navigate to profile: missing required data");
+      return;
+    }
+
+    try {
+      const profileParams = new URLSearchParams({
+        userId: userId?.toString() || '',
+        username: profile.username?.toString() || '',
+        displayName: profile.displayName?.toString() || '',
+        subscriberCount: profile.subscribers?.toString() || '',
+        avatar: profile.avatar?.toString() || '',
+      });
+
+      router.push(`/(chat)/${userId}/Profile?${profileParams.toString()}` as any);
+    } catch (error) {
+      console.error("Error navigating to profile:", error);
+    }
+  }, [userId, profile, router]);
+
+  const goBack = useCallback(() => {
+    router.back();
+  }, [router]);
+
+  // Handle scroll events to show/hide scroll-to-bottom button
+  const handleScroll = useCallback((event: any) => {
+    const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+
+    // For inverted FlatList, offset > 100 means user has scrolled up from bottom
+    const isScrolledUp = contentOffset.y > 100;
+    setShowScrollToBottomButton(isScrolledUp);
+  }, []);
+
+  // Scroll to bottom of messages
+  const scrollToBottom = useCallback(() => {
+    if (flatListRef?.current) {
+      flatListRef.current.scrollToOffset({ offset: 0, animated: true });
+      setShowScrollToBottomButton(false);
+    }
+  }, [flatListRef]);
+
+  // Handle audio call button press
+  // const handleAudioCallPress = async () => {
+  //   try {
+  //     setIsInitiatingCall(true);
+  //     setCallType("audio");
+
+  //     // Start an audio call using the initiateCall function
+  //     // await initiateCall([userId], "audio");
+
+  //     // Navigation will happen in the useEffect when currentCall becomes available
+  //   } catch (error) {
+  //     setIsInitiatingCall(false);
+  //     console.error("Failed to initiate audio call:", error);
+  //     showError(
+  //       "Call Failed",
+  //       "Unable to start call. Please try again later."
+  //     );
+  //   }
+  // };
+
+  // Handle video call button press
+  // const handleVideoCallPress = async () => {
+  //   try {
+  //     setIsInitiatingCall(true);
+  //     setCallType("video");
+
+  //     // Start a video call using the initiateCall function
+  //     // await initiateCall([userId], "video");
+
+  //     // Navigation will happen in the useEffect when currentCall becomes available
+  //   } catch (error) {
+  //     setIsInitiatingCall(false);
+  //     console.error("Failed to initiate video call:", error);
+  //     showError(
+  //       "Call Failed",
+  //       "Unable to start video call. Please try again later."
+  //     );
+  //   }
+  // };
+
+
+  // Process messages with date separators
+  const messagesWithDateSeparators = useMemo(() => {
+    if (!messages || messages.length === 0) return [];
+
+    const groupedMessages = groupMessagesByDate(messages as MessageWithDate[]);
+    return flattenMessagesWithSeparators(groupedMessages);
+  }, [messages]);
+
+  // getItemLayout to prevent crashes during scroll
+  const getItemLayout = useCallback((data: any, index: number) => {
+    // fixed heights to prevent array access issues during virtualization
+    const ESTIMATED_MESSAGE_HEIGHT = 80; // estimate for safety
+    
+    return {
+      length: ESTIMATED_MESSAGE_HEIGHT,
+      offset: ESTIMATED_MESSAGE_HEIGHT * index,
+      index,
+    };
+  }, []);
+
+  // Cleanup when component unmounts
+  useEffect(() => {
+    return () => {
+      // Mark component as unmounted to prevent further operations
+      isUnmountedRef.current = true;
+    };
+  }, []);
+
+  const renderItem = ({ item, index }: { item: any; index: number }) => {
+    // Handle date separator items
+    if (item.type === "dateSeparator") {
+      return <DateSeparator date={item.displayDate} />;
+    }
+
+    // Handle regular message items
+    return renderMessage({ item, index });
+  };
+
+
+  // Memoized other user object to prevent recreation with null guards
+  const otherUser = useMemo(() => {
+    if (!userId || !profile) {
+      return null;
+    }
+
+    const preloadedData = preloadedProfileData || {};
+    const displayNameParts = (profile.displayName || '').toString().split(' ');
+    
+    return {
+      _id: userId?.toString() || '',
+      username: profile.username?.toString() || '',
+      firstName: preloadedData?.firstName?.toString() || displayNameParts[0] || profile.username?.toString() || '',
+      lastName: preloadedData?.lastName?.toString() || displayNameParts.slice(1).join(' ') || '',
+      profilePicture: profile.avatar?.toString() || '',
+    };
+  }, [userId, profile, preloadedProfileData]);
+
+  const renderMessage = useCallback(({ item, index }: { item: Message; index: number }) => {
+    // Return null for invalid items to prevent crashes
+    if (!item || typeof item !== 'object') return null;
+    
+    const isUser = item.userId === currentUserId;
+    const formattedTime = formatMessageTime(item.time || item.createdAt);
+
+    // Create a stable message ID with fallback
+    const messageId = item.id?.toString() || item._id?.toString() || `msg-${index}-${item.text?.slice(0, 10) || 'empty'}`;
+
+    // Check if message is a video link
+    const videoData = extractVideoDataFromMessage(item.text);
+    const isVideoMessage = !!videoData;
+
+    // Check if message is a community invite link
+    const inviteData = extractCommunityInviteDataFromMessage(item.text);
+    const isCommunityInvite = !!inviteData;
+
+    // Smart timestamp showing (matches community chat logic)
+    const shouldShowTimestamp = () => {
+      // If no messages array or index provided, always show timestamp
+      if (!messages || !Array.isArray(messages) || index === undefined) return true;
+
+      // Get current message details
+      const currentSender = item.userId;
+      const currentTime = new Date(item.createdAt || item.time || '');
+      const currentMinute = currentTime.getTime() - (currentTime.getTime() % 60000); // Round to minute
+
+      // Find all messages from the same sender with the same minute
+      const sameMinuteMessages = messages.filter(msg => {
+        if (!msg || !msg.userId || !(msg.createdAt || msg.time)) return false;
+
+        const msgSender = msg.userId;
+        const msgTime = new Date(msg.createdAt || msg.time || '');
+        const msgMinute = msgTime.getTime() - (msgTime.getTime() % 60000);
+
+        return msgSender === currentSender && msgMinute === currentMinute;
+      });
+
+      // If there's only one message in this minute group, show timestamp
+      if (sameMinuteMessages.length <= 1) return true;
+
+      // Sort messages by timestamp to find the latest one
+      sameMinuteMessages.sort((a, b) => 
+        new Date(a.createdAt || a.time || '').getTime() - 
+        new Date(b.createdAt || b.time || '').getTime()
+      );
+
+      // Show timestamp only if this is the latest message in the group
+      const latestMessage = sameMinuteMessages[sameMinuteMessages.length - 1];
+      const latestMessageId = latestMessage.id || latestMessage._id;
+      const currentMessageId = item.id || item._id;
+
+      return latestMessageId === currentMessageId;
+    };
+
+    // Handle community invite messages
+    if (isCommunityInvite && inviteData) {
+      const inviteDataObj = inviteData || {};
+      
+      return (
+        <View
+          style={[
+            styles.messageContainer,
+            isUser ? styles.userMessageContainer : styles.otherMessageContainer,
+          ]}
+        >
+          <View style={[styles.messageWrapper, { maxWidth: "85%" }]}>
+            <View
+              style={[
+                styles.messageBubble,
+                { padding: 0, backgroundColor: "transparent" },
+              ]}
+            >
+              <CommunityInviteCard
+                communityId={inviteDataObj?.communityId?.toString() || ''}
+                communityName={inviteDataObj?.communityName?.toString() || ''}
+                communityAvatar={inviteDataObj?.communityAvatar?.toString() || ''}
+                memberCount={parseInt(inviteDataObj?.memberCount?.toString() || '0', 10) || 0}
+                invitedBy={{
+                  username: inviteDataObj?.invitedBy?.username?.toString() || 'Unknown',
+                  firstName: inviteDataObj?.invitedBy?.firstName?.toString() || '',
+                  lastName: inviteDataObj?.invitedBy?.lastName?.toString() || ''
+                }}
+                description={inviteDataObj?.description?.toString() || ''}
+              />
+            </View>
+            {formattedTime && shouldShowTimestamp() && (
+              <View
+                style={[
+                  styles.timestampContainer,
+                  isUser
+                    ? styles.userTimestampContainer
+                    : styles.otherTimestampContainer,
+                ]}
+              >
+                <Typography
+                  style={[styles.timestamp, { color: Colors[theme].textLight }]}
+                  size={11}
+                >
+                  {formattedTime}
+                </Typography>
+                {/* Show status ticks with dot separator for user's messages */}
+                {isUser && (
+                  <>
+                    <Typography
+                      style={[
+                        styles.timestampDot,
+                        { color: Colors[theme].textLight },
+                      ]}
+                      size={11}
+                    >
+                      •
+                    </Typography>
+                    <MessageStatus
+                      isSent={true}
+                      isRead={item.seen || false}
+                      size={11}
+                    />
+                  </>
+                )}
+              </View>
+            )}
+          </View>
+        </View>
+      );
+    }
+
+    // Render regular message
+    return (
+      <View
+        style={[
+          styles.messageContainer,
+          isUser ? styles.userMessageContainer : styles.otherMessageContainer,
+        ]}
+      >
+        <View style={[styles.messageWrapper, isVideoMessage && styles.videoMessageWrapper]}>
+          <View
+            style={[
+              styles.messageBubble,
+              isUser
+                ? styles.userMessageBubble
+                : [
+                  styles.otherMessageBubble,
+                  { backgroundColor: Colors[theme].cardBackground },
+                ],
+              isVideoMessage && { padding: 0, backgroundColor: "transparent" },
+            ]}
+          >
+            {isVideoMessage && videoData ? (
+              // Check if it's a photo post vs video post
+              videoData.images && videoData.images.length > 0 ? (
+                <SharedPhotoCard 
+                  photoData={videoData} 
+                  messageSender={isUser ? userDetails : (otherUser || {})}
+                />
+              ) : (
+                <SharedVideoCard 
+                  videoData={videoData} 
+                  messageSender={isUser ? userDetails : (otherUser || {})}
+                />
+              )
+            ) : (
+              <Typography
+                style={[
+                  styles.messageText,
+                  isUser
+                    ? styles.userMessageText
+                    : [styles.otherMessageText, { color: Colors[theme].text }],
+                ]}
+              >
+                {item.text}
+              </Typography>
+            )}
+          </View>
+          {formattedTime && shouldShowTimestamp() && (
+            <View
+              style={[
+                styles.timestampContainer,
+                isUser
+                  ? styles.userTimestampContainer
+                  : styles.otherTimestampContainer,
+              ]}
+            >
+              <Typography
+                style={[styles.timestamp, { color: Colors[theme].textLight }]}
+                size={11}
+              >
+                {formattedTime}
+              </Typography>
+              {/* Show status ticks with dot separator for user's messages */}
+              {isUser && (
+                <>
+                  <Typography
+                    style={[
+                      styles.timestampDot,
+                      { color: Colors[theme].textLight },
+                    ]}
+                    size={11}
+                  >
+                    •
+                  </Typography>
+                  <MessageStatus
+                    isSent={true}
+                    isRead={item.seen || false}
+                    size={11}
+                  />
+                </>
+              )}
+            </View>
+          )}
+        </View>
+      </View>
+    );
+  }, [currentUserId, formatMessageTime, extractVideoDataFromMessage, extractCommunityInviteDataFromMessage, otherUser, theme]);
+
+  // Loading component for FlatList - memoized to prevent recreation
+  const renderLoadingFooter = useCallback(() => {
+    if (messages.length === 0) {
+      return (
+        <View style={styles.loadingContainer}>
+          <ActivityIndicator size="large" color={Colors.general.primary} />
+        </View>
+      );
+    }
+    return null;
+  }, [messages.length]);
+
+  // Profile card component (shown after messages load) - memoized to prevent recreation
+  const renderProfileCard = useCallback(() => (
+    <>
+      {/* Profile Card */}
+      <View style={styles.profileCardContainer}>
+        <View style={styles.avatarWrapper}>
+          <Avatar
+            imageSource={{ uri: profile.avatar }}
+            // alt={username}
+            size={100}
+            uri
+            ringColor={Colors[theme].avatar}
+            ringThickness={3}
+            showRing={true}
+          />
+        </View>
+
+        <View
+          style={[
+            styles.profileCard,
+            { backgroundColor: Colors[theme].cardBackground },
+          ]}
+        >
+          <Typography size={24} weight="600" style={styles.profileName}>
+            {profile.displayName || username}
+          </Typography>
+          <Typography
+            weight="500"
+            style={styles.subscribers}
+            color={Colors[theme].textLight}
+          >
+            {profile.subscribers} Subscriber
+            {profile.subscribers !== "1" ? "s" : ""}
+          </Typography>
+          <Typography style={styles.bio}>{profile.bio}</Typography>
+
+          <View style={styles.actionButtons}>
+            <TouchableOpacity style={styles.actionButton} onPress={viewProfile}>
+              <TouchableOpacity
+                style={styles.profileButton}
+                onPress={viewProfile}
+              >
+                <Ionicons name="person-outline" size={20} color="#6E6E6E" />
+              </TouchableOpacity>
+              <Typography weight="600" color={Colors[theme].textBold}>
+                Profile
+              </Typography>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.actionButton}
+              onPress={() => setIsReportModalVisible(true)}
+            >
+              <TouchableOpacity style={styles.reportButton}>
+                <Ionicons name="flag-outline" size={20} color="#F5222D" />
+              </TouchableOpacity>
+              <Typography weight="600" color="#F5222D">
+                Report
+              </Typography>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+
+      {/* <Typography style={styles.collectivetimestamp} size={12} color={Colors[theme].textLight}>
+        Oct 12 at 2:44 PM
+      </Typography> */}
+    </>
+  ), [profile, theme, username, setIsReportModalVisible, viewProfile]);
+
+
+  return (
+    <SafeAreaView
+      style={[styles.container, { backgroundColor: Colors[theme].background }]}
+    >
+      {/* Header */}
+      <View
+        style={[
+          styles.header,
+          {
+            backgroundColor: Colors[theme].background,
+            borderBottomColor: Colors[theme].cardBackground,
+          },
+        ]}
+      >
+        <TouchableOpacity onPress={goBack} style={styles.backButton}>
+          <Ionicons name="chevron-back" size={24} color={Colors[theme].text} />
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.userInfo} onPress={viewProfile}>
+          <Text
+            style={[styles.username, { color: Colors[theme].textBold }]}
+            numberOfLines={1}
+            ellipsizeMode="tail"
+          >
+            {profile.displayName || username}
+          </Text>
+          <Text style={styles.status}>{userOnlineStatus}</Text>
+        </TouchableOpacity>
+        {/* <View style={styles.headerActions}>
+          <TouchableOpacity
+            style={styles.headerButton}
+            onPress={handleAudioCallPress}
+            disabled={isInitiatingCall}
+          >
+            <Ionicons
+              name="call-outline"
+              size={22}
+              color={
+                isInitiatingCall && callType === "audio"
+                  ? "#888"
+                  : Colors.general.primary
+              }
+            />
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.headerButton}
+            onPress={handleVideoCallPress}
+            disabled={isInitiatingCall}
+          >
+            <Ionicons
+              name="videocam-outline"
+              size={22}
+              color={
+                isInitiatingCall && callType === "video"
+                  ? "#888"
+                  : Colors.general.primary
+              }
+            />
+          </TouchableOpacity>
+        </View> */}
+      </View>
+      {/* Chat Messages */}
+      {/* <FlatList
+        data={messagesWithDateSeparators}
+        ref={flatListRef}
+        renderItem={renderItem}
+        keyExtractor={(item, index) => item.id || item.type === 'dateSeparator' ? item.id : index.toString()}
+        contentContainerStyle={styles.messagesList}
+        onContentSizeChange={() =>
+          flatListRef.current?.scrollToEnd({ animated: true })
+        }
+        onLayout={() => flatListRef.current?.scrollToEnd({ animated: true })}
+      /> */}
+
+      {/* Chat Messages */}
+      {loadingMessages ? (
+        <View style={[styles.messagesList, { flex: 1 }]}>
+          {renderProfileCard()}
+          <ChatSkeletonLoader />
+        </View>
+      ) : messagesWithDateSeparators.length === 0 ? (
+        <View style={[styles.messagesList, { flex: 1 }]}>
+          {renderProfileCard()}
+          <View style={styles.emptyStateContainer}>
+            <Text style={styles.emptyStateText}>No messages yet</Text>
+            <Text style={styles.emptyStateSubtext}>Start the conversation!</Text>
+          </View>
+        </View>
+      ) : (
+        <FlatList
+          data={[...messagesWithDateSeparators].reverse()}
+          ref={flatListRef}
+          renderItem={renderItem}
+          keyExtractor={(item, index) => {
+            if (!item) return `fallback-${index}`;
+            if (item.type === 'dateSeparator') {
+              return item.id || `separator-${index}`;
+            }
+            return item.id?.toString() || item._id?.toString() || `msg-${index}-${item.text?.slice(0, 5) || 'empty'}`;
+          }}
+          contentContainerStyle={styles.messagesList}
+          ListFooterComponent={renderProfileCard}
+          inverted={true}
+          onScroll={handleScroll}
+          scrollEventThrottle={16}
+          // Performance optimizations for message virtualization
+          removeClippedSubviews={true}
+          maxToRenderPerBatch={10}
+          updateCellsBatchingPeriod={100}
+          initialNumToRender={20}
+          windowSize={10}
+          getItemLayout={getItemLayout}
+          // Memory optimization
+          disableVirtualization={false}
+        />
+      )}
+
+      {/* Typing Indicator */}
+      {otherUserTyping && (
+        <View style={[styles.typingIndicator, { backgroundColor: Colors[theme].cardBackground }]}>
+          <Typography style={[styles.typingText, { color: Colors[theme].textLight }]}>
+            {profile.displayName || username} is typing...
+          </Typography>
+        </View>
+      )}
+
+      {/* Message Input */}
+      <ChatInput
+        onSend={handleSendChat}
+        message={chatMessage}
+        setMessage={setChatMessage}
+        onTypingStart={handleTypingStart}
+        onTypingStop={handleTypingStop}
+
+        togglePicker={togglePicker}
+        isPickerOpen={isPickerOpen}
+        uploadedImages={uploadedImageUrls}
+        onRemoveImage={removeUploadedUrl}
+        // communityId={communityData._id}
+        // onRemoveVideo={removeUploadedVideoUrl}
+        // uploadedVideo={uploadedVideoUrls}
+        // videoDetails={videoDetails}
+      />
+
+      {/* Scroll to Bottom Button */}
+      {showScrollToBottomButton && (
+        <TouchableOpacity
+          style={[styles.scrollToBottomButton, { backgroundColor: Colors[theme].cardBackground }]}
+          onPress={scrollToBottom}
+          activeOpacity={0.8}
+        >
+          <Ionicons
+            name="chevron-down"
+            size={24}
+            color={Colors[theme].text}
+          />
+        </TouchableOpacity>
+      )}
+
+      {/* Report Modal */}
+      <ReportModal
+        isVisible={isReportModalVisible}
+        onClose={() => setIsReportModalVisible(false)}
+        userId={userId as string}
+      />
+    </SafeAreaView>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    marginBottom: 10,
+  },
+  backButton: {
+    padding: 5,
+  },
+  userInfo: {
+    flex: 1,
+    marginLeft: 10,
+  },
+  username: {
+    fontSize: 16,
+    fontWeight: "600",
+    maxWidth: 200,
+  },
+  status: {
+    fontSize: 12,
+    color: "#4CAF50",
+  },
+  headerActions: {
+    flexDirection: "row",
+  },
+  headerButton: {
+    padding: 8,
+    marginLeft: 8,
+  },
+  profileCardContainer: {
+    width: "100%",
+    paddingTop: 36,
+    paddingBottom: 5,
+    marginBottom: 16,
+  },
+  avatarWrapper: {
+    alignItems: "center",
+    zIndex: 2,
+  },
+  profileCard: {
+    borderRadius: 20,
+    paddingTop: 45,
+    paddingHorizontal: 20,
+    marginTop: -40,
+    marginHorizontal: 16,
+    paddingBottom: 14,
+    shadowColor: "#000",
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.1,
+    shadowRadius: 3.84,
+    elevation: 5,
+  },
+  profileName: {
+    fontWeight: "600",
+    textAlign: "center",
+  },
+  subscribers: {
+    fontSize: 14,
+    color: "#666",
+    textAlign: "center",
+    marginBottom: 12,
+  },
+  bio: {
+    textAlign: "center",
+    marginBottom: 18,
+  },
+  actionButtons: {
+    flexDirection: "row",
+    justifyContent: "center",
+    marginBottom: 14,
+    gap: 24,
+  },
+  actionButton: {
+    justifyContent: "center",
+    alignItems: "center",
+    gap: 6,
+  },
+  profileButton: {
+    alignItems: "center",
+    justifyContent: "center",
+    height: 40,
+    width: 40,
+    borderRadius: 20,
+    marginHorizontal: 6,
+    backgroundColor: "#BAD9CC",
+  },
+  reportButton: {
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 12,
+    height: 40,
+    width: 40,
+    borderRadius: 20,
+    marginHorizontal: 6,
+    backgroundColor: "#FFF1F0",
+  },
+  collectivetimestamp: {
+    textAlign: "center",
+    marginTop: 16,
+    marginBottom: 16,
+  },
+  messagesList: {
+    paddingHorizontal: 16,
+  },
+  messageContainer: {
+    marginBottom: 15,
+    flexDirection: "row",
+  },
+  userMessageContainer: {
+    justifyContent: "flex-end",
+  },
+  otherMessageContainer: {
+    justifyContent: "flex-start",
+  },
+  messageWrapper: {
+    maxWidth: "75%",
+  },
+  videoMessageWrapper: {
+    maxWidth: "85%",
+  },
+  messageBubble: {
+    borderRadius: 18,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  userMessageBubble: {
+    backgroundColor: "#4CAF50",
+  },
+  otherMessageBubble: {},
+  messageText: {
+    fontSize: 14,
+  },
+  userMessageText: {
+    color: "#FFF",
+  },
+  otherMessageText: {},
+  timestampContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 2,
+    marginHorizontal: 4,
+    gap: 2,
+  },
+  userTimestampContainer: {
+    justifyContent: "flex-end",
+  },
+  otherTimestampContainer: {
+    justifyContent: "flex-start",
+  },
+  timestamp: {
+    fontSize: 11,
+  },
+  timestampDot: {
+    fontSize: 11,
+    lineHeight: 11,
+  },
+  loadingContainer: {
+    paddingVertical: 40,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  emptyStateContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: 32,
+  },
+  emptyStateText: {
+    fontSize: 18,
+    fontWeight: "600",
+    marginBottom: 8,
+    textAlign: "center",
+  },
+  emptyStateSubtext: {
+    fontSize: 14,
+    color: "#666",
+    textAlign: "center",
+  },
+  scrollToBottomButton: {
+    position: 'absolute',
+    bottom: 80,
+    right: 16,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    justifyContent: 'center',
+    alignItems: 'center',
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    zIndex: 1000,
+  },
+  typingIndicator: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    marginHorizontal: 8,
+    marginBottom: 8,
+    borderRadius: 16,
+  },
+  typingText: {
+    fontSize: 14,
+    fontStyle: 'italic',
+  },
+  errorContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 32,
+    gap: 16,
+  },
+});
+
+export default InboxScreen;

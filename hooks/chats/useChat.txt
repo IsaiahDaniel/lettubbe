@@ -1,0 +1,463 @@
+import { useEffect, useRef, useState, useCallback } from "react";
+import { Socket } from "socket.io-client";
+import useAuth from "../auth/useAuth";
+import { getSocket } from "@/helpers/utils/socket";
+import { socketManager } from "@/helpers/utils/socketManager";
+import { useGetOnlineUsersState, useGetUserIdState } from "@/store/UsersStore";
+import { FlatList } from "react-native";
+import { useQueryClient } from "@tanstack/react-query";
+import { markConversationAsRead } from "@/services/chats.service";
+
+interface Message {
+  messageId: any;
+  id: any;
+  _id: any;
+  sender: string;
+  createdAt: string;
+  text: string;
+  userId: string;
+}
+
+const useChat = (conversationId?: string) => {
+  const { usersOnline, setUsersOnline } = useGetOnlineUsersState();
+  const { userDetails, token } = useAuth();
+  const { userId } = useGetUserIdState();
+  const queryClient = useQueryClient();
+
+  const [chatMessage, setChatMessage] = useState("");
+  const [messages, setMessages] = useState<any[]>([]);
+  const [loadingMessages, setLoadingMessages] = useState<boolean>(true);
+  const [isTyping, setIsTyping] = useState(false);
+  const [otherUserTyping, setOtherUserTyping] = useState(false);
+
+  const flatListRef = useRef<FlatList>(null);
+  const socketRef = useRef<Socket | null>(null);
+  const hasInitializedRef = useRef<string | null>(null);
+  
+  // Rate limiting for markMessagesAsRead to prevent spam
+  const lastMarkReadTimeRef = useRef<number>(0);
+  const MARK_READ_THROTTLE = 3000; // 3 seconds minimum between calls
+
+  // Memoize message deduplication with comprehensive null guards
+  const processNewMessage = useCallback((data: Message, prevMessages: any[]) => {
+    try {
+      const msgData = data || {};
+      const prevMsgs = Array.isArray(prevMessages) ? prevMessages : [];
+      
+      const messageId = (msgData.messageId || msgData.id || msgData._id)?.toString() || '';
+      const messageText = msgData.text?.toString() || '';
+      const serverUserId = (msgData.sender || msgData.userId)?.toString() || '';
+
+      if (!messageText || !serverUserId) {
+        console.warn("Invalid message data: missing text or userId");
+        return prevMsgs;
+      }
+
+      // Check for duplicate by ID first
+      if (messageId) {
+        const messageExists = prevMsgs.some(msg => {
+          const msgObj = msg || {};
+          return msgObj?.id?.toString() === messageId || 
+                 msgObj?._id?.toString() === messageId || 
+                 msgObj?.messageId?.toString() === messageId;
+        });
+        if (messageExists) {
+          return prevMsgs;
+        }
+      }
+
+      // Find and replace temp messages with same content and sender
+      const hasMatchingTempMessage = prevMsgs.some(msg => {
+        const msgObj = msg || {};
+        const msgText = msgObj?.text?.toString() || '';
+        const msgUserId = (msgObj?.userId || msgObj?.sender)?.toString() || '';
+        const msgId = msgObj?.id?.toString() || '';
+        
+        return msgText === messageText &&
+               msgUserId === serverUserId &&
+               msgId.startsWith('temp-');
+      });
+
+      if (hasMatchingTempMessage) {
+        return prevMsgs.map(msg => {
+          const msgObj = msg || {};
+          const msgText = msgObj?.text?.toString() || '';
+          const msgUserId = (msgObj?.userId || msgObj?.sender)?.toString() || '';
+          const msgId = msgObj?.id?.toString() || '';
+          
+          const shouldReplace = msgText === messageText &&
+                                msgUserId === serverUserId &&
+                                msgId.startsWith('temp-');
+          
+          return shouldReplace ? {
+            ...msgData,
+            userId: serverUserId,
+            id: messageId,
+          } : msgObj;
+        });
+      }
+
+      // Add new message
+      const normalizedMessage = {
+        ...msgData,
+        userId: serverUserId,
+        id: messageId,
+        time: msgData?.createdAt?.toString() || new Date().toISOString(),
+      };
+      return [...prevMsgs, normalizedMessage];
+    } catch (error) {
+      console.error("Error processing new message:", error);
+      return prevMessages;
+    }
+  }, []);
+
+  // Memoize event handlers to prevent recreation
+  const handleConnect = useCallback(() => {
+    console.log("✅ Connected to WebSocket Chat:", socketRef.current?.id);
+    if (socketRef.current && token && userDetails?._id && userId) {
+      socketRef.current.emit("joinChat", { userId: userDetails._id, receiverId: userId });
+      socketRef.current.emit("getPreviousMessages", { receiverId: userId });
+    }
+  }, [token, userDetails?._id, userId]);
+
+  const handleOnlineUsers = useCallback((data: any) => {
+    setUsersOnline(data);
+  }, [setUsersOnline]);
+
+  const handlePreviousMessages = useCallback((conversations: any) => {
+    const allMessages = conversations?.map((msg: any) => ({
+      text: msg.text,
+      userId: msg.userId,
+      time: msg.createdAt,
+      seen: msg.seen || false,
+      id: msg._id || msg.id,
+    })) || [];
+
+    setMessages(allMessages);
+    setLoadingMessages(false);
+  }, []);
+
+  const handleNewMessage = useCallback((data: Message) => {
+    console.log("📩 New personal chat message received:", data);
+    setMessages((prevMessages) => processNewMessage(data, prevMessages));
+    
+    // Auto-mark as read if the message is from the other user (not our own message)
+    const messageUserId = (data.sender || data.userId)?.toString();
+    if (messageUserId && messageUserId !== userDetails?._id?.toString()) {
+      // Delay slightly to ensure message is processed first
+      setTimeout(() => {
+        if (userDetails?._id) {
+          const now = Date.now();
+          if (now - lastMarkReadTimeRef.current >= MARK_READ_THROTTLE) {
+            lastMarkReadTimeRef.current = now;
+            console.log("📖 Auto-marking new message as read via API");
+            
+            // Make API call to mark messages as read
+            if (conversationId) {
+              markConversationAsRead(conversationId)
+                .then(() => {
+                  console.log("✅ Messages marked as read via API");
+                  // Trigger conversation list refresh to update badges
+                  queryClient.invalidateQueries({ queryKey: ['getUserConversations'] });
+                  queryClient.invalidateQueries({ queryKey: ['unreadCount'] });
+                })
+                .catch((error) => {
+                  console.error("❌ Failed to mark messages as read via API:", error);
+                });
+            }
+            
+            // Still send socket for real-time updates
+            if (socketRef.current) {
+              const socketConversationId = `${userDetails._id}-${userId}`;
+              socketRef.current.emit("markMessagesAsRead", {
+                conversationId: socketConversationId,
+                userId: userDetails._id,
+                receiverId: userId
+              });
+            }
+          }
+        }
+      }, 500);
+    }
+  }, [processNewMessage, userDetails?._id, userId, queryClient, conversationId]);
+
+  const handleUserTyping = useCallback((data: any) => {
+    if (data.userId !== userDetails?._id) {
+      setOtherUserTyping(true);
+    }
+  }, [userDetails?._id]);
+
+  const handleUserStoppedTyping = useCallback((data: any) => {
+    if (data.userId !== userDetails?._id) {
+      setOtherUserTyping(false);
+    }
+  }, [userDetails?._id]);
+
+  const handleMessagesMarkedAsRead = useCallback((data: any) => {
+    console.log("📖 Messages marked as read:", data);
+    setMessages((prevMessages) =>
+      prevMessages.map(msg => {
+        if (msg.userId === userDetails?._id) {
+          return { ...msg, seen: true };
+        }
+        return msg;
+      })
+    );
+  }, [userDetails?._id]);
+
+  const handleDisconnect = useCallback(() => {
+    console.log("❌ Disconnected from WebSocket");
+  }, []);
+
+  useEffect(() => {
+    if (!token || !userId || !userDetails?._id) {
+      // Clean up if we don't have required data
+      if (socketRef.current) {
+        console.log("🧹 Cleaning up socket due to missing auth data");
+        socketRef.current.removeAllListeners();
+        socketRef.current = null;
+      }
+      hasInitializedRef.current = null;
+      return;
+    }
+
+    const conversationKey = `${token}-${userId}`;
+    
+    // Skip if already initialized for this conversation
+    if (hasInitializedRef.current === conversationKey && socketRef.current) {
+      return;
+    }
+
+    console.log(`🔄 Initializing chat for conversation: ${conversationKey}`);
+
+    // Enhanced cleanup for conversation changes
+    if (socketRef.current && hasInitializedRef.current) {
+      console.log("🧹 Cleaning up previous conversation listeners");
+      
+      // Unregister from socket manager
+      socketManager.unregisterComponent(`useChat-${hasInitializedRef.current}`);
+      
+      // Remove only our specific listeners, not all listeners (other components might be using the socket)
+      socketRef.current.off("connect", handleConnect);
+      socketRef.current.off("onlineUser", handleOnlineUsers);
+      socketRef.current.off("previousMessages", handlePreviousMessages);
+      socketRef.current.off("newMessage", handleNewMessage);
+      socketRef.current.off("userTyping", handleUserTyping);
+      socketRef.current.off("userStoppedTyping", handleUserStoppedTyping);
+      socketRef.current.off("messagesMarkedAsRead", handleMessagesMarkedAsRead);
+      socketRef.current.off("disconnect", handleDisconnect);
+    }
+
+    // Reset state for new conversation
+    setMessages([]);
+    setLoadingMessages(true);
+    setOtherUserTyping(false);
+    setIsTyping(false);
+    hasInitializedRef.current = conversationKey;
+
+    // Use socket manager for connection
+    const componentId = `useChat-${conversationKey}`;
+    const socket = socketManager.getConnection(token, componentId);
+    
+    if (!socket) {
+      console.error("❌ Failed to get socket connection");
+      setLoadingMessages(false);
+      return;
+    }
+
+    // Register with socket manager
+    socketManager.registerComponent(componentId, [
+      "connect", "onlineUser", "previousMessages", "newMessage", 
+      "userTyping", "userStoppedTyping", "messagesMarkedAsRead", "disconnect"
+    ]);
+
+    socketRef.current = socket;
+
+    // Set up event listeners with error handling
+    try {
+      socket.on("connect", handleConnect);
+      socket.on("onlineUser", handleOnlineUsers);
+      socket.on("previousMessages", handlePreviousMessages);
+      socket.on("newMessage", handleNewMessage);
+      socket.on("userTyping", handleUserTyping);
+      socket.on("userStoppedTyping", handleUserStoppedTyping);
+      socket.on("messagesMarkedAsRead", handleMessagesMarkedAsRead);
+      socket.on("disconnect", handleDisconnect);
+
+      console.log("✅ Socket event listeners attached for conversation:", conversationKey);
+
+      // If already connected, emit initial events
+      if (socket.connected) {
+        handleConnect();
+      }
+    } catch (error) {
+      console.error("❌ Error setting up socket listeners:", error);
+      setLoadingMessages(false);
+    }
+
+    return () => {
+      console.log("🧹 Cleaning up useChat effect");
+      
+      // Clear debounce timer
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+      }
+      
+      // Unregister from socket manager
+      if (hasInitializedRef.current) {
+        socketManager.unregisterComponent(`useChat-${hasInitializedRef.current}`);
+      }
+      
+      // Clean up socket listeners
+      if (socketRef.current) {
+        try {
+          socketRef.current.off("connect", handleConnect);
+          socketRef.current.off("onlineUser", handleOnlineUsers);
+          socketRef.current.off("previousMessages", handlePreviousMessages);
+          socketRef.current.off("newMessage", handleNewMessage);
+          socketRef.current.off("userTyping", handleUserTyping);
+          socketRef.current.off("userStoppedTyping", handleUserStoppedTyping);
+          socketRef.current.off("messagesMarkedAsRead", handleMessagesMarkedAsRead);
+          socketRef.current.off("disconnect", handleDisconnect);
+          
+          console.log("✅ Socket listeners cleaned up successfully");
+        } catch (error) {
+          console.error("❌ Error cleaning up socket listeners:", error);
+        }
+      }
+      
+      hasInitializedRef.current = null;
+    };
+  }, [token, userId, userDetails?._id, handleConnect, handleOnlineUsers, handlePreviousMessages, handleNewMessage, handleUserTyping, handleUserStoppedTyping, handleMessagesMarkedAsRead, handleDisconnect]);
+
+  //   useEffect(() => {
+  //     if (currentMessage.current) {
+  //       currentMessage.current.scrollIntoView({
+  //         behavior: "smooth",
+  //         block: "end",
+  //       });
+  //     }
+  //   });
+
+  const getUserOnlineStatus = (userId: string, users: string[]) => {
+    return users.includes(userId) ? "Online" : "Offline";
+  };
+
+  const userOnlineStatus = getUserOnlineStatus(userId as string, usersOnline);
+
+  // Store timer reference for cleanup
+  const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // Debounce query invalidation to prevent excessive calls
+  const debouncedInvalidateQueries = useCallback(() => {
+    // Clear any existing timer
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+    
+    // Set new timer - increased debounce time to prevent infinite loops
+    debounceTimerRef.current = setTimeout(() => {
+      // Only invalidate if we have messages to avoid infinite loops
+      if (messages.length > 0) {
+        queryClient.invalidateQueries({ queryKey: ["getUserConversations"] });
+        queryClient.invalidateQueries({ queryKey: ["getUserConversations", "infinite"] });
+      }
+      debounceTimerRef.current = null;
+    }, 2000); // from 500ms to 2000ms
+  }, [queryClient, messages.length]);
+
+  const handleSendChat = useCallback(() => {
+    if (!chatMessage.trim() || !userDetails?._id || !socketRef.current) return;
+
+    const newMessage = {
+      sender: userDetails._id,
+      receiver: userId,
+      text: chatMessage,
+      userId: userDetails._id,
+      id: `temp-${Date.now()}`,
+      time: new Date().toISOString(),
+    };
+
+    console.log("📨 Sending chat message:", newMessage);
+
+    // Stop typing when sending message
+    if (isTyping) {
+      socketRef.current.emit("stopTyping", {
+        conversationId: `${userDetails._id}-${userId}`,
+        userId: userDetails._id,
+        receiverId: userId
+      });
+      setIsTyping(false);
+    }
+
+    // Emit the message
+    socketRef.current.emit("chat", newMessage);
+
+    // Optimistically update UI before server confirmation
+    setMessages((prevMessages) => [...prevMessages, newMessage]);
+    setChatMessage("");
+
+    // Debounced query invalidation
+    debouncedInvalidateQueries();
+  }, [chatMessage, userDetails?._id, userId, isTyping, debouncedInvalidateQueries]);
+
+  const handleTypingStart = useCallback(() => {
+    if (socketRef.current && !isTyping && userDetails?._id) {
+      setIsTyping(true);
+      socketRef.current.emit("typing", {
+        conversationId: `${userDetails._id}-${userId}`,
+        userId: userDetails._id,
+        receiverId: userId
+      });
+    }
+  }, [isTyping, userDetails?._id, userId]);
+
+  const handleTypingStop = useCallback(() => {
+    if (socketRef.current && isTyping && userDetails?._id) {
+      setIsTyping(false);
+      socketRef.current.emit("stopTyping", {
+        conversationId: `${userDetails._id}-${userId}`,
+        userId: userDetails._id,
+        receiverId: userId
+      });
+    }
+  }, [isTyping, userDetails?._id, userId]);
+
+  const markMessagesAsRead = useCallback(() => {
+    if (!socketRef.current || !userDetails?._id) return;
+    
+    const now = Date.now();
+    if (now - lastMarkReadTimeRef.current < MARK_READ_THROTTLE) {
+      console.log("📖 Skipping markMessagesAsRead - rate limited");
+      return;
+    }
+    
+    lastMarkReadTimeRef.current = now;
+    console.log("📖 Marking messages as read");
+    socketRef.current.emit("markMessagesAsRead", {
+      conversationId: `${userDetails._id}-${userId}`,
+      userId: userDetails._id,
+      receiverId: userId
+    });
+  }, [userDetails?._id, userId]);
+
+  return {
+    usersOnline,
+    handleSendChat,
+    flatListRef,
+    userOnlineStatus,
+    // currentMessage,
+    chatMessage,
+    setChatMessage,
+    messages,
+    loadingMessages,
+    isTyping,
+    otherUserTyping,
+    handleTypingStart,
+    handleTypingStop,
+    markMessagesAsRead,
+  };
+};
+
+export default useChat;

@@ -1,0 +1,74 @@
+// {
+//   "cli": {
+//     "version": ">= 16.0.1",
+//     "appVersionSource": "remote"
+//   },
+//   "build": {
+//     "development": {
+//       "developmentClient": true,
+//       "distribution": "internal"
+//     },
+//     "preview": {
+//       "distribution": "internal",
+//       "android": {
+//         "buildType": "apk",
+//         "gradleCommand": ":app:assembleRelease",
+//         "image": "latest"
+//       },
+//       "node": "20.18.0"
+//     },
+//     "production": {
+//       "autoIncrement": true,
+//       "android": {
+//         "buildType": "apk",
+//         "gradleCommand": ":app:assembleRelease",
+//         "image": "latest"
+//       },
+//       "node": "20.18.0"
+//     }
+//   },
+//   "submit": {
+//     "production": {
+//       "distribution": "store"
+//     }
+//   }
+// }
+
+{
+  "cli": {
+    "version": ">= 16.0.1",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "preview": {
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk",
+        "image": "latest"
+      },
+      "node": "20.18.0",
+      "autoIncrement": false
+    },
+    "production": {
+      "distribution": "store",
+      "autoIncrement": true,
+      "android": {
+        "buildType": "app-bundle",
+        "image": "latest"
+      },
+      "node": "20.18.0"
+    }
+  },
+  "submit": {
+    "production": {
+      "android": {
+        "track": "internal"
+      }
+    }
+  }
+}
+
